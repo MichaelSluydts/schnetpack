@@ -1,0 +1,49 @@
+#!/usr/bin/env python
+
+import argparse
+from pathlib import Path
+import os
+
+parser = argparse.ArgumentParser(description='Process some integers.')
+parser.add_argument('mode', type=str, help='train/eval/MD')
+
+parser.add_argument('--account', dest='account', type=str, help='PBS credit account')
+parser.add_argument('--walltime', dest='walltime', type=float, help='Walltime  (in hours, for example 36.5)')
+
+args = parser.parse_args()
+
+cluster = os.getenv('VSC_INSTITUTE_CLUSTER')
+curdir = Path.cwd()
+
+p = Path('./' + cluster + '.sh')
+
+submitscript = '#!/bin/bash\n'
+submitscript += f'#PBS -N {curdir}\n'
+if args.account:
+    submitscript += f'#PBS -A {args.account}\n'
+submitscript += '#PBS -m a\n'
+submitscript += f'#PBS -N {walltime}\n'
+
+submitscript = """
+#PBS -l walltime=$walltime
+
+#PBS -l nodes=$2:ppn=$3:gpus=$4
+
+ulimit -s unlimited
+
+source activate fastai1
+module load schnet/fastai-pytorch
+#module load CUDA/10.0.130
+#module load cuDNN/7.4.1-CUDA-10.0.130
+cd /dev/shm
+rsync -uav  /scratch/leuven/404/vsc40479/benchmarks/* benchmarks/
+cd benchmarks
+python $5 $6 $7 $8 $9 ${10} ${11} > /scratch/leuven/404/vsc40479/benchmarks/models/$6-$(date +%s)
+cd /dev/shm
+rsync -uav benchmarks/* /scratch/leuven/404/vsc40479/benchmarks/
+rm -rf benchmarks
+exit 0
+"""
+
+p.write_text(submitscript)
+

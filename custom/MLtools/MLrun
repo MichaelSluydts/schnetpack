@@ -1,0 +1,538 @@
+#!/usr/bin/env python
+
+#Setting up the script
+import sys
+sys.path.insert(0,'C:\\Users\\Michael\\Documents\\fastai2\\')
+sys.path.insert(0,'../../')
+
+import configargparse as argparse
+
+from functools import partial
+import logging
+import numpy as np
+import os
+from pathlib import Path
+import pdb
+import ase.io
+
+#schnetpack2
+import schnetpack2
+import schnetpack2.custom.datasets.extxyz1
+from schnetpack2.custom.utils.samplers import RandomSampler, StratifiedSampler
+from schnetpack2.custom.representation.schnet import SchNetInteraction
+from schnetpack2.custom.loss import MSEloss, logrootloss,MAEloss,NLLMSEloss, NLLMSEloss_forces
+from schnetpack2.custom.metrics import Emetric,Fmetric, uncertainty,uncertainty_forces
+from schnetpack2.custom.optimizers import Adam_sdr, SGD_sdr, RAdam, Ranger, RangerLars
+import schnetpack2.custom.representation
+from schnetpack2.custom.environment import TorchEnvironmentProvider, AseEnvironmentProvider, SimpleEnvironmentProvider
+from schnetpack2.environment import ASEEnvironmentProvider
+from schnetpack2.utils import compute_params
+
+#fastai
+from schnetpack2.custom.fastai.basic_data import DataBunch
+from schnetpack2.custom.fastai.basic_train import Learner
+from schnetpack2.custom.fastai.train import *
+from schnetpack2.custom.fastai.callbacks.csv_logger import *
+from fastai.callbacks.tracker import *
+#from fastai.callbacks.mem import PeakMemMetric
+from fastai.core import listify
+
+import torch
+import torch.nn as nn
+import time
+
+parser = argparse.ArgumentParser(prog='Deep learning for atomistic systems',
+description='Through this script you will be able to train, evaluate and run simulations with deep learning potentials.',
+epilog='For more information contact Michael Sluydts.', fromfile_prefix_chars='@')
+
+parser.add('-conf', '--config', required=True, is_config_file=True, help='config file path')
+
+
+
+
+#subparsers = parser.add_subparsers(dest='mode', help='actions')
+
+#train_parser = subparsers.add_parser('train', help='Train a model')
+#Could combine eval and MD, to be seen
+#eval_parser = subparsers.add_parser('eval', help='Evaluate a model')
+#MD_parser = subparsers.add_parser('MD', help='Run a molecular dynamics simulation')
+#gan_parser = subparsers.add_parser('generate', help='Use a GAN to generate structures.')
+
+#Training a model
+parser.add_argument('mode', choices=['train', 'eval', 'md', 'generate'], help='The action you wish to perform.')
+eval = parser.add_argument_group('eval')
+eval.add_argument('-struct', '--structure', default='POSCAR', help='Input file.')
+eval.add_argument('-form', '--format', default='vasp', help='Format of input file.')
+eval.add_argument('-bl','--batch_list', default = None, help='List of structures to evaluate.')
+
+
+md = parser.add_argument_group('md')
+md.add_argument('-st', '--steps', default=100, type=int, help='Number of md steps.')
+md.add_argument('-ts', '--timestep', default=1., type=float, help='Timestep.')
+md.add_argument('-tt', '--thermotime', default=100., type=float, help='Time constant thermostat.')
+md.add_argument('-bt', '--barotime', default=1000., type=float, help='Time constant barostat.')
+md.add_argument('-temp', '--temperature', default=300., type=float, help='Temperature.')
+md.add_argument('-nve','--nve', action='store_true', help='Use the NVE ensemble.')
+md.add_argument('-nvt','--nvt', action='store_true', help='Use the NVT ensemble.')
+md.add_argument('-npt','--npt', action='store_true', help='Use the NPT ensemble.')
+md.add_argument('-rel','--relax', action='store_true', help='Relax the structure.')
+md.add_argument('-elastic','--elastic', action='store_true', help='Calculate elastic tensor.')
+
+data = parser.add_argument_group('data')
+data.add_argument('-lm', '--load_model', default=None, help='Model to load.')
+data.add_argument('-db', '--database', default=None, help='Name of database to load.')
+data.add_argument('-prop', '--property', default='energy', help='Main target property.')
+data.add_argument('-pa','--per_atom',action='store_true', help='Property is normalized per atom.')
+data.add_argument('-m', '--mean', type=float, default=None, help='The dataset mean.')
+data.add_argument('-std', '--stddev', type=float, default=None, help='The dataset standard deviation.')
+data.add_argument('-rd', '--root_dir', default=None, type=Path, help='Root dir where model is run.')
+data.add_argument('-ld', '--log_dir', default=None, type=Path, help='Alternative log dir.')
+data.add_argument('-dd', '--data_dir', default='data', help='Data folder name.')
+data.add_argument('-md', '--model_dir', default='models', help='Model folder name.')
+data.add_argument('-bs', '--batch_size', default=32, type=int, help='Batch size per GPU.')
+data.add_argument('-samp', '--sampler', choices=['random', 'stratified'], default='random', help='The sampler used.')
+data.add_argument('-nsamp', '--num_samples', default=None, help='Number of samples drawn per epoch (/10 for validation). Defaults to min(dataset_size,10000)')
+data.add_argument('-aref', '--atom_ref', default=None, help='Reference values per atom.')
+data.add_argument('-norm','--normalize',action='store_true', help='Normale property per atom.')
+
+#train = train_parser.add_argument_group('train')
+
+
+
+arch = parser.add_argument_group('architecture')
+arch.add_argument('-arch', '--architecture', choices=['schnet', 'angular_schnet', 'physnet', 'acsf'], default='schnet', help='Model architecture to use.')
+arch.add_argument('-c', '--cutoff', type=float, default=5., help='Local environment cutoff radius.')
+arch.add_argument('-start', '--start', type=float, default=0., help='Start of the local environment.')
+arch.add_argument('-maxz', '--maxz', type=int, default=128, help='Maximum allowed atomic number.')
+arch.add_argument('-pbc', '--periodic', dest='pbc', action='store_true', help='Enables periodic boundary conditions.')
+
+arch.add_argument('-feat', '--features', type=int, default=32, help='Number of features describing an atomic environment.')
+arch.add_argument('-filt', '--filters', type=int, default=16, help='Number of filters used in the CFconv.')
+arch.add_argument('-int', '--interactions', type=int, default=3, help='Number of interaction blocks.')
+arch.add_argument('-nout', '--num_output', type=int, default=5, help='Number of output layers.')
+
+arch.add_argument('-ndist', '--num_dist', type=int, default=256, help='Number of coefficients used for distance expansion.')
+
+arch.add_argument('-dsc', '--disable_skip', dest='sc', action='store_false', help='Disables skip connections.')
+arch.add_argument('-df','--disable_forces', dest='forces', action='store_false', help='Disable force calculation.')
+arch.add_argument('-sdr','--sdr', action='store_true', help='Enables the Stochastic Delta Rule.')
+arch.add_argument('-u','--uncertainty', action='store_true', help='Enables uncertainty on the output properties.')
+arch.add_argument('-uf','--uncertainty_forces', action='store_true', help='Enables uncertainty on the forces.')
+arch.add_argument('-bn','--batch_norm', action='store_true', help='Enables batch normalization.')
+arch.add_argument('-do','--dropout', type=float, default=0., help='Dropout probability')
+arch.add_argument('-a','--attention', type=int, default=0, help='Number of attention heads.')
+arch.add_argument('-rep','--repulsive', type=float, default=0., help='Repulsive cutoff.')
+#TODO add force uncertainties
+
+tech = parser.add_argument_group('technical')
+tech.add_argument('-cpu','--cpu', dest='cuda', action='store_false', help='Switch between GPU and CPU')
+tech.add_argument('-nw','--num_workers', type=int, default=9, help='Number of CPU workers for the dataloader (per GPU).')
+tech.add_argument('-mp','--mixed_precision', action='store_true', help='Enable mixed precision.')
+tech.add_argument('-dp','--double_precision', action='store_true', help='Enable double precision.')
+tech.add_argument("--local_rank",action='store_true', help='Fancy pantsy parallel.')
+tech.add_argument("--track_mem",action='store_true', help='Track peak memory.')
+
+opt  = parser.add_argument_group('optimizer')
+opt.add_argument('-e', '--epochs', type=int, default=8, help='Number of epochs')
+opt.add_argument('-lr', '--learning_rate', type=float, default=2e-3, help='Your maximum learning rate.')
+opt.add_argument('-d', '--div', type=float, default=10.0, help='Division factor to obtain minimal learning rate.')
+opt.add_argument('-p', '--peak', type=float, default=0.2, help='Fractional location of training cycle where lr will peak.')
+opt.add_argument('-wd', '--weight_decay', type=float, default=0.01, help='Global weight decay.')
+opt.add_argument('-sched', '--schedule', choices=['constant', 'plateau','1cycle','lrfind'], default='1cycle', help='Your learning rate schedule, default one cycle.')
+opt.add_argument('-o', '--opt', choices=['RangerLars','Ranger','RAdam','Adam', 'SGD'], default='RangerLars', help='The optimizer used.')
+opt.add_argument('-kp', '--kp', type=float, default=0.1, help='Weight constant in loss function of property.')
+opt.add_argument('-kf', '--kf', type=float, default=1.0, help='Weight constant in loss function of forces.')
+opt.add_argument('-sb', '--save_best', action='store_true', help='Save best model')
+opt.add_argument('-lsuv','--lsuv', action='store_true', help='Enable LSUV initialization.')
+opt.add_argument('-lc', '--log_csv', action='store_true', help='Log training progress in csv file')
+opt.add_argument('-es', '--early_stopping', action='store_true', help='Enable early stopping.')
+opt.add_argument('-pm', '--property_monitor', type=str, default='val_loss', help='Early stopping property.')
+opt.add_argument('-mind', '--min_delta', type=float, default=0.01, help='Early stopping min difference.')
+opt.add_argument('-pat', '--patience', type=int, default=3, help='Early stopping patience.')
+
+
+args = parser.parse_args()
+
+print(args)
+
+#Helper function, can go into utils later
+def plot_recorder(recorder, save_name, skip_start:int=10, skip_end:int=5):
+   "Plot learning rate and losses, trimmed between `skip_start` and `skip_end`. Optionally plot and return min gradient"
+   import matplotlib.pyplot as plt
+   lrs = recorder.lrs[skip_start:-skip_end] if skip_end > 0 else recorder.lrs[skip_start:]
+   losses = recorder.losses[skip_start:-skip_end] if skip_end > 0 else recorder.losses[skip_start:]
+   np.save(save_name, np.array([x.item() for x in losses]))
+   fig, ax = plt.subplots(1,1)
+   ax.plot(lrs, losses)
+   ax.set_ylabel("Loss")
+   ax.set_xlabel("Learning Rate")
+   ax.set_xscale('log')
+   ax.xaxis.set_major_formatter(plt.FormatStrFormatter('%.0e'))
+   mg = (np.gradient(np.array([x.item() for x in losses]))).argmin()
+   print(f"Min numerical gradient: {lrs[mg]:.2E}")
+   ax.plot(lrs[mg],losses[mg],markersize=10,marker='o',color='red')
+   plt.show()
+   fig.savefig(save_name+'.png')
+
+if args.lsuv:
+        
+    def lsuv_module(m, xb):
+        h = Hook(m, append_stat)
+        if isinstance(m,schnetpack2.nn.base.Aggregate):
+            while model(xb) is not None and abs(h.std-1) > 1e-3:
+                with torch.no_grad():
+                    m.rescale.data /= h.std
+        else:
+            if m.bias is not None:
+                while model(xb) is not None and abs(h.mean)  > 1e-3:
+                    with torch.no_grad():
+                        m.bias -= h.mean
+            while model(xb) is not None and abs(h.std-1) > 1e-3:
+                with torch.no_grad():
+                    m.weight.data /= h.std
+        h.remove()
+        return h.mean,h.std
+
+    def find_modules(m, cond):
+        if cond(m): return [m]
+        return sum([find_modules(o,cond) for o in m.children()], [])
+
+    def is_lin_layer(l):
+        lin_layers = (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.Linear, nn.ReLU)
+        return isinstance(l, lin_layers)
+
+    def append_stat(hook, mod, inp, outp):
+        outp = next(iter(outp))
+        d = outp.data
+        hook.mean,hook.std = d.mean().item(),d.std().item()
+
+
+
+
+    class Hook():
+        def __init__(self, m, f): self.hook = m.register_forward_hook(partial(f, self))
+        def remove(self): self.hook.remove()
+        def __del__(self): self.remove()
+
+    class ListContainer():
+        def __init__(self, items): self.items = listify(items)
+        def __getitem__(self, idx):
+            if isinstance(idx, (int,slice)): return self.items[idx]
+            if isinstance(idx[0],bool):
+                assert len(idx)==len(self) # bool mask
+                return [o for m,o in zip(idx,self.items) if m]
+            return [self.items[i] for i in idx]
+        def __len__(self): return len(self.items)
+        def __iter__(self): return iter(self.items)
+        def __setitem__(self, i, o): self.items[i] = o
+        def __delitem__(self, i): del(self.items[i])
+        def __repr__(self):
+            res = f'{self.__class__.__name__} ({len(self)} items)\n{self.items[:10]}'
+            if len(self)>10: res = res[:-1]+ '...]'
+            return res
+
+    from torch.nn import init
+
+    class Hooks(ListContainer):
+        def __init__(self, ms, f): super().__init__([Hook(m, f) for m in ms])
+        def __enter__(self, *args): return self
+        def __exit__ (self, *args): self.remove()
+        def __del__(self): self.remove()
+
+        def __delitem__(self, i):
+            self[i].remove()
+            super().__delitem__(i)
+
+        def remove(self):
+            for h in self: h.remove()
+
+### END HELPER
+
+# Setup the architecture
+def get_model(args, atomref=None, mean=None, stddev=None, train_loader=None):
+    if args.architecture == 'schnet':
+        representation = schnetpack2.custom.representation.SchNet(
+            n_atom_basis=args.features,
+            n_filters=args.filters,
+            n_interactions=args.interactions,
+            cutoff=args.cutoff,
+            n_gaussians=args.num_dist,
+            normalize_filter=False,
+            coupled_interactions=False,
+            return_intermediate=False,
+            return_stress=args.npt,
+            max_z=args.maxz,
+            cutoff_network=schnetpack2.nn.cutoff.CosineCutoff,
+            filter_network_type="original",
+            n_expansion_coeffs=args.num_dist,
+            trainable_gaussians=True,
+            distance_expansion=None,
+            sc=args.sc,
+            sdr = args.sdr,
+            start = args.start,
+            bn=args.batch_norm,p=args.dropout,debug=False, attention=args.attention)
+    elif args.architecture == 'angular_schnet':
+        representation = schnetpack2.custom.representation.SchNetAngular(
+            n_atom_basis=args.features,
+            n_filters=args.filters,
+            n_interactions=args.interactions,
+            n_angular = 8.,
+            zetas = {1.,2.,3.,4.},
+            cutoff=args.cutoff,
+            n_gaussians=args.num_dist,
+            normalize_filter=False,
+            coupled_interactions=False,
+            return_intermediate=False,
+            return_stress=args.npt,
+            max_z=args.maxz,
+            cutoff_network=schnetpack2.nn.cutoff.CosineCutoff,
+            filter_network_type="original",
+            n_expansion_coeffs=args.num_dist,
+            trainable_gaussians=True,
+            distance_expansion=None,
+            sc=args.sc,
+            sdr = args.sdr,
+            start = args.start,
+            bn=args.batch_norm,p=args.dropout,debug=False, attention=args.attention)
+
+    aggmode = 'avg' if args.per_atom else 'sum'
+        
+    if args.mixed_precision:
+        atomwise_output = schnetpack2.custom.atomisticfp16.MultiOutput(args.features, 1, mean=mean, aggregation_mode=aggmode, stddev=stddev,
+        atomref=atomref, return_force=args.forces, create_graph=args.forces, return_stress = args.npt, train_embeddings=True, n_layers=args.num_output,bn=args.batch_norm,p=args.dropout, sdr=args.sdr, uncertainty=args.uncertainty,repulsive=args.repulsive,per_atom=args.per_atom,normalize=args.normalize)
+    else:
+        atomwise_output = schnetpack2.custom.atomistic.MultiOutput(args.features, 1, mean=mean, aggregation_mode=aggmode, stddev=stddev,
+        atomref=atomref, return_force=args.forces, create_graph=args.forces, return_stress = args.npt, train_embeddings=True, n_layers=args.num_output,bn=args.batch_norm,p=args.dropout, sdr=args.sdr, uncertainty=args.uncertainty,repulsive=args.repulsive,per_atom=args.per_atom,normalize = args.normalize)
+    model = schnetpack2.custom.atomistic.AtomisticModel(representation, atomwise_output)
+
+    model = nn.DataParallel(model)
+    if args.load_model:
+        print('Restoring model from ' + str( args.model_dir / args.load_model))
+        state = torch.load( args.model_dir / args.load_model)
+        #model.load_state_dict(state,strict=False)
+        #print(set(model.module.state_dict().keys()).difference(state['model'].keys()))
+        pretrained_dict = state['model']
+        model_dict = model.module.state_dict()
+        pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+        model_dict.update(pretrained_dict) 
+        #print(model_dict['output_modules.out_net.1.out_net.4.weight'])
+        model.module.load_state_dict(pretrained_dict,strict=False)
+        #print(model.module.state_dict()['output_modules.out_net.1.out_net.4.weight'])
+    logging.info(f"The model you built has: {compute_params(model)} parameters")
+    return(model)
+
+# Setup the data
+if args.data_dir is None:
+    args.data_dir = args.rootdir / 'data'
+if args.model_dir is None:
+    args.model_dir = args.rootdir / 'models'
+    if not os.path.isfile(args.model_dir):
+        os.mkdir(args.model_dir)
+else:
+    args.model_dir = Path(args.model_dir)
+
+if args.pbc:
+    env = TorchEnvironmentProvider(args.cutoff,device=torch.device('cuda'))
+else:
+    env = SimpleEnvironmentProvider()
+path = str(args.root_dir / args.data_dir) 
+data_train = schnetpack2.custom.datasets.extxyz1.ExtXYZ(path + '/train' + args.database + '.db',path +'/train' + args.database + '.xyz',environment_provider = env, properties=[args.property,'forces'])
+data_val = schnetpack2.custom.datasets.extxyz1.ExtXYZ(path + '/val' + args.database + '.db',path + '/val' + args.database + '.xyz',environment_provider = env, properties=[args.property,'forces'])
+
+args.nbins = args.batch_size
+ngpus = torch.cuda.device_count()
+
+if ngpus > 0:
+    args.num_workers *= ngpus
+    args.batch_size *= ngpus
+
+#Replacement per epoch?
+args.replacement = True
+if args.num_samples is not None:
+    args.num_samples = int(args.num_samples)
+
+if args.num_samples == 0:
+    args.num_samples = None
+if args.sampler == 'random':
+    if args.num_samples is not None:
+        train_sampler = RandomSampler(data_train,num_samples=args.num_samples,replacement=args.replacement)
+        args.num_samples //= 10
+    else:
+        args.num_samples = len(data_train)
+        train_sampler = RandomSampler(data_train,num_samples=args.num_samples,replacement=args.replacement)
+        args.num_samples = len(data_val)
+    val_sampler = RandomSampler(data_val,num_samples=args.num_samples,replacement=args.replacement)
+elif args.sampler == 'stratified':
+    train_sampler = StratifiedSampler(data_train,num_samples=args.num_samples, nbins=args.nbins,replacement=args.replacement)
+    val_sampler = StratifiedSampler(data_val,num_samples=args.num_samples // 10, nbins=args.nbins,replacement=args.replacement)
+
+train_loader = schnetpack2.custom.datasqlite.AtomsLoader(data_train, batch_size=args.batch_size,num_workers=args.num_workers, pin_memory=True,sampler=train_sampler)
+val_loader = schnetpack2.custom.datasqlite.AtomsLoader(data_val, batch_size=args.batch_size, num_workers=args.num_workers, pin_memory=True,sampler=val_sampler)
+
+if args.mean is None or args.stddev is None:
+    mean, stddev = train_loader.get_statistics(args.property, False)
+else:
+    mean, stddev = torch.tensor(args.mean).cuda(), torch.tensor(args.stddev).cuda()
+# mean_forces, stddev_forces train_loader.get_statistics('forces', True)
+print('The data has mean ' + str(float(mean.cpu().detach())) + ', stddev ' + str(float(stddev.cpu().detach())))
+data = DataBunch(train_loader, val_loader, collate_fn=schnetpack2.data.collate_atoms)
+
+model = get_model(args, atomref=args.atom_ref, mean=mean, stddev=stddev, train_loader=train_loader)
+
+learn = Learner(data, model, model_dir=args.model_dir)
+torch.cuda.empty_cache()
+if args.double_precision:
+    print('Enabled double precision.')
+    def to_double(b):
+        return recurse(lambda x: x.double() if x.dtype not in [torch.int64, torch.int32, torch.int16] else x, b)
+    learn.data.add_tfm(to_double)
+    learn.model.double()
+
+
+if args.mode in ['md','relax']:
+    from schnetpack2.md import AtomsConverter
+    at = ase.io.read(args.structure,format=args.format)
+    conv = AtomsConverter(environment_provider=env)
+    atin = conv.convert_atoms(atoms=at)
+    atin = {k : v.cuda() for k,v in atin.items()}
+    model.eval()
+
+from schnetpack2.md import AtomsConverter
+
+def evaluate_atoms(atin):
+    conv = AtomsConverter(environment_provider=env)
+    atin = conv.convert_atoms(atoms=atin)
+    results = model(atin)
+    
+    plist = []
+    for k in ['y','dydx','stress']:
+        if k in results.keys():
+            plist.append(results[k].detach().cpu())
+
+    return(plist)
+
+if args.mode == 'eval':
+
+    if args.batch_list:
+        for i in open(args.batch_list,'r').readlines():
+            i = i.strip()
+            if args.format == 'vasp-xml':
+                atlist = ase.io.read(i,format=args.format,index=':')
+                for j in atlist:
+                    print(i,evaluate_atoms(j),j.get_potential_energy()/len(j.get_atomic_numbers()))
+            at = ase.io.read(i,format=args.format)
+            print(i,float(evaluate_atoms(at)[0]))
+    elif args.format == 'vasp-xml':
+        atlist = ase.io.read(args.structure,format=args.format,index=':')
+        for i in atlist:
+            pred = float(evaluate_atoms(i)[0])
+            orig = i.get_potential_energy()/len(i.get_atomic_numbers())
+            diff = np.abs(pred - orig)
+            print(pred,orig,diff)
+    else:
+        print(args.structure,evaluate_atoms(args.structure))
+    
+    #print(learn.predict(atin))
+# Train the model
+elif args.mode == 'md':
+    from schnetpack2.custom.interface.yaff_inherited import *
+
+    mlff = SchnetForceField('schnetforcefield', at, model, conv, env)
+    filename = args.structure + '_' + str(time.time())
+    if args.npt:
+        npt = mlff.NPT(args.steps, nprint = 10, dt = args.timestep, temp = args.temperature, start = 0,thermotime=args.thermotime,barotime=args.barotime, name = filename)
+    elif args.nvt:
+        nvt = mlff.NVT(args.steps, nprint = 10, dt = args.timestep, temp = args.temperature, start = 0,timecon=args.thermotime, name = filename)
+    elif args.nve:
+        nvt = mlff.NVE(args.steps, nprint = 10, dt = args.timestep, temp = args.temperature, start = 0, name = filename)
+    elif args.relax:
+        import yaff.sampling.opt as opt
+        dof = yaff.sampling.dof.FullCellDOF(mlff)
+        optimizer = opt.CGOptimizer(dof)
+        optimizer.run(args.steps)
+    elif args.elastic:
+        print(estimate_elastic(mlff))
+    print(filename + '_final.xyz')
+    ase.io.write(filename + '_final.xyz',mlff.atoms,format='extxyz')
+elif args.mode == 'train':
+    pytorch_total_params = sum(p.numel() for p in model.parameters())
+
+    pytorch_train_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    print('The model contains ' + str(pytorch_total_params) + ' parameters of which ' + str(pytorch_train_params) + ' are trainable.')
+    # Could allow a general optimizer name and append sdr
+    if args.opt == 'RangerLars':
+        learn.opt_func = RangerLars
+    if args.opt == 'Ranger':
+        learn.opt_func = Ranger
+    if args.opt == 'RAdam':
+        learn.opt_func = RAdam
+    if args.opt == 'Adam':
+        if args.sdr:
+            learn.opt_func = Adam_sdr
+        else:
+            learn.opt_func = torch.optim.Adam
+    elif args.opt == 'SGD':
+        if args.sdr:
+            learn.opt_func = SGD
+        else:
+            learn.opt_func = SGD_sdr
+    
+    # Setup loss function
+    if args.uncertainty_forces:
+        learn.loss_func = partial(NLLMSEloss_forces,mean=mean.cuda(), std=stddev.cuda(),mean_forces=mean_forces.cuda(), std_forces=stddev_forces.cuda(),kf=0.01,ke=10.0)
+    elif args.uncertainty:
+        learn.loss_func = partial(NLLMSEloss,mean=mean.cuda(), std=stddev.cuda(), std_forces=stddev_forces.cuda(),kf=2000.0,ke=1000.0)
+    else:
+        learn.loss_func = partial(MAEloss,kf=args.kf,ke=args.kp, standardize = args.mixed_precision, mean=mean, stddev=stddev, property=args.property,per_atom=args.per_atom)
+
+    # Setup metrics
+    learn.metrics=[partial(Emetric, stddev=stddev.cuda(), property=args.property, per_atom=args.per_atom)]
+    if args.forces:
+        learn.metrics.append(partial(Fmetric,stddev=stddev.cuda()))
+    model_name = str(args.database) + '_' + str(time.time()) 
+    #TODO SaveModelCallback(learn=learn,every='improvement', monitor='Fmetric', name='bestmodel')
+    callbacks = []
+    if not args.mixed_precision:
+        callbacks += [TerminateOnNaNCallback()]
+    
+    if args.lsuv:
+        temp = next(iter(train_loader))
+        temp = {k : v.cuda() for k,v in temp.items()}
+        xb,yb = temp,temp
+        mods = find_modules(learn.model, lambda o: isinstance(o,schnetpack2.nn.base.Dense) or isinstance(o,schnetpack2.nn.base.Aggregate))
+        
+        print('Starting LSUV init.')
+        for m in mods: print(lsuv_module(m, xb))
+        print('Finished LSUV init.')
+    
+  #  if args.track_mem:
+   #     callbacks.append(PeakMemMetric(learn))
+    
+    if args.early_stopping:
+        callbacks.append(partial(EarlyStoppingCallback, monitor=args.property_monitor, min_delta=args.min_delta, patience=args.patience)())
+
+    if args.log_csv:
+        callbacks.append(CSVLogger(learn, model_name))
+
+    if args.save_best:
+        callbacks.append(SaveModelCallback(learn=learn,every='improvement', monitor='val_loss', name=model_name + '_best'))
+
+    if args.schedule == 'plateau':
+        #TODO add full configuration opties for reduceLR
+        callbacks.append(ReduceLROnPlateauCallback(learn=learn, monitor='val_loss',mode='auto',patience=5,factor=0.5,min_delta=0.001))
+
+    if args.mixed_precision:
+        learn.to_fp16(flat_master=True, dynamic=True)
+
+    if args.schedule == 'lrfind':
+        learn.lr_find(start_lr=1e-6,end_lr=10, num_it=100,no_grad_val=not args.forces,wd=args.weight_decay)
+        plot_recorder(learn.recorder, model_name)
+    elif args.schedule == '1cycle':
+        print(not args.forces)
+        learn.fit_one_cycle(cyc_len=args.epochs, max_lr=args.learning_rate, moms=(0.95, 0.85), div_factor=args.div, pct_start=args.peak, wd=args.weight_decay, no_grad_val=not args.forces, callbacks=callbacks)
+    else:
+        learn.fit(epochs=args.epochs, lr=args.learning_rate, wd=args.weight_decay, no_grad_val=not args.forces, callbacks=callbacks)
+
+    #TODO learn.save
+    print(learn.save( args.root_dir / args.model_dir /  model_name , return_path=True))

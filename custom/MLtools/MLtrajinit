@@ -1,0 +1,32 @@
+#!/usr/bin/env python
+import random, sys
+import ase.io
+import argparse
+
+parser = argparse.ArgumentParser(description='Process some integers.')
+parser.add_argument('vasprun', metavar='path', type=str, help='MD trajectory')
+parser.add_argument('--scale', type=float, help='scale volume')
+parser.add_argument('--output', type=str, default='./POSCAR', help='scale volume')
+parser.add_argument('--vacancy', type=int, help='vacancy')
+parser.add_argument('--rattle', type=float, help='vacancy')
+args = parser.parse_args()
+
+
+allmd = ase.io.read(args.vasprun,index=':')
+
+rand = allmd[random.randint(0,len(allmd)-1)]
+if args.rattle > 0.:
+    rand.rattle(stdev=args.rattle)
+#rand.volume=10
+
+if args.scale is not None:
+    rand.set_cell(rand.cell*float(args.scale), scale_atoms=True)
+
+start = rand.get_number_of_atoms()
+if args.vacancy > 0:
+    for i in range(args.vacancy):
+        rand.pop(random.randint(0,start-i-1))
+
+
+
+ase.io.write(args.output,rand,format='vasp')
